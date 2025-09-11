@@ -1,37 +1,55 @@
 import express from "express";
 import bodyParser from "body-parser";
-import OpenAI from "openai";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
 
 dotenv.config();
-
 const app = express();
 app.use(bodyParser.json());
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// 🔹 1. Vastaa Teniosin webhook-kutsuun kun puhelu alkaa
+app.post("/voice", async (req, res) => {
+  console.log("Tenios webhook:", req.body);
 
-app.post("/webhook", async (req, res) => {
-  const userMessage = req.body?.speechText || "En kuullut mitään";
+  // Asiakkaan puhe tekstiksi (STT): Tenios antaa sen automaattisesti webhookissa
+  const userText = req.body.speechResult || "Hei, mitä asiaa?";
 
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: "Olet ystävällinen puhelinassistentti suomeksi." },
-      { role: "user", content: userMessage },
-    ],
+  // 🔹 2. Lähetä teksti OpenAI:lle
+  const completion = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-5", // tai gpt-4o-mini jos haluat halvempaa
+      input: userText
+    })
   });
+  const data = await completion.json();
+  const aiText = data.output[0].content[0].text || "Pahoittelut, en ymmärtänyt.";
 
-  const reply = completion.choices[0].message.content;
+  console.log("AI vastasi:", aiText);
 
+  // 🔹 3. Vastaa Teniosille TTS-ohjeilla
   res.json({
-    action: "talk",
-    text: reply,
-    language: "fi-FI",
+    "version": "1.0.0",
+    "response": [
+      {
+        "action": "talk",
+        "voice": "female",
+        "text": aiText
+      },
+      {
+        "action": "listen", // Jatka kuuntelemista
+        "bargein": true
+      }
+    ]
   });
 });
 
-app.listen(3000, () => {
-  console.log("Serveri käynnissä portissa 3000");
+// Käynnistä serveri
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Serveri pyörii portissa ${PORT}`);
 });
