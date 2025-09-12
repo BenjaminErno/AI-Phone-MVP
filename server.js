@@ -1,55 +1,83 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import fetch from "node-fetch";
+import OpenAI from "openai";
 
 dotenv.config();
+
 const app = express();
 app.use(bodyParser.json());
 
-// 🔹 1. Vastaa Teniosin webhook-kutsuun kun puhelu alkaa
-app.post("/voice", async (req, res) => {
-  console.log("Tenios webhook:", req.body);
-
-  // Asiakkaan puhe tekstiksi (STT): Tenios antaa sen automaattisesti webhookissa
-  const userText = req.body.speechResult || "Hei, mitä asiaa?";
-
-  // 🔹 2. Lähetä teksti OpenAI:lle
-  const completion = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-5", // tai gpt-4o-mini jos haluat halvempaa
-      input: userText
-    })
-  });
-  const data = await completion.json();
-  const aiText = data.output[0].content[0].text || "Pahoittelut, en ymmärtänyt.";
-
-  console.log("AI vastasi:", aiText);
-
-  // 🔹 3. Vastaa Teniosille TTS-ohjeilla
-  res.json({
-    "version": "1.0.0",
-    "response": [
-      {
-        "action": "talk",
-        "voice": "female",
-        "text": aiText
-      },
-      {
-        "action": "listen", // Jatka kuuntelemista
-        "bargein": true
-      }
-    ]
-  });
+// OpenAI client
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
 });
 
-// Käynnistä serveri
-const PORT = process.env.PORT || 3000;
+// Healthcheck route
+app.get("/", (req, res) => {
+  res.send("Telnyx AI Phone MVP is running ✅");
+});
+
+// Telnyx webhook route
+app.post("/webhook", async (req, res) => {
+  try {
+    console.log("Incoming webhook:", JSON.stringify(req.body, null, 2));
+
+    const eventType = req.body.data?.event_type;
+
+    if (eventType === "call.initiated") {
+      // Vastataan kun puhelu alkaa
+      return res.json({
+        data: {
+          result: "actions",
+          actions: [
+            {
+              "say": {
+                "text": "Hei! Tämä on tekoälyvastaaja. Kuinka voin auttaa sinua tänään?"
+              }
+            }
+          ]
+        }
+      });
+    }
+
+    if (eventType === "call.speech") {
+      // Asiakas sanoo jotain, lähetetään OpenAI:lle
+      const userSpeech = req.body.data.payload?.speech?.transcription || "";
+
+      const aiResponse = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "Olet asiakaspalvelija, joka auttaa ystävällisesti ja kirjaa tietoja." },
+          { role: "user", content: userSpeech }
+        ]
+      });
+
+      const reply = aiResponse.choices[0].message.content;
+
+      return res.json({
+        data: {
+          result: "actions",
+          actions: [
+            {
+              "say": { "text": reply }
+            }
+          ]
+        }
+      });
+    }
+
+    // Default: ignore other events
+    res.json({ data: { result: "noop" } });
+
+  } catch (error) {
+    console.error("Webhook error:", error);
+    res.status(500).send("Server error");
+  }
+});
+
+// Renderin portti
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Serveri pyörii portissa ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
