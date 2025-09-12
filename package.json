@@ -1,8 +1,9 @@
 {
   "name": "ai-phone-mvp",
   "version": "1.0.0",
-  "description": "MVP AI Phone answering app with Telnyx",
+  "description": "MVP AI phone bot with Telnyx + OpenAI",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
@@ -13,3 +14,4 @@
     "openai": "^4.0.0"
   }
 }
+
