@@ -32,7 +32,7 @@ app.post("/webhook", async (req, res) => {
     console.log("Webhook:", event);
 
     // Alku: vastaa kun puhelu alkaa
-    if (event === "call.initiated") {
+    if (event === "call.initiated" || event === "call.incoming") {
       conversations[callId] = [
         { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja." }
       ];
@@ -69,6 +69,12 @@ app.post("/webhook", async (req, res) => {
 
       if (!transcript) {
         return res.json({ data: { result: "noop" } });
+      }
+
+      if (!conversations[callId]) {
+        conversations[callId] = [
+          { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja." }
+        ];
       }
 
       conversations[callId].push({ role: "user", content: transcript });
