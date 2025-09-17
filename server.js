@@ -2,6 +2,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import fetch from "node-fetch";   // tämä pitää olla mukana!
 
 dotenv.config();
 
@@ -15,7 +16,9 @@ const client = new OpenAI({
 // Pidetään keskustelut muistissa puhelun ID:n mukaan
 const conversations = {};
 
-// Healthcheck (testaa selaimella https://...onrender.com/healthz)
+const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+
+// Healthcheck
 app.get("/healthz", (req, res) => {
   res.send("ok");
 });
@@ -34,14 +37,30 @@ app.post("/webhook", async (req, res) => {
         { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja." }
       ];
 
-      return res.json({
-        data: {
-          result: "actions",
-          actions: [
-            { say: { text: "Hei! Tervetuloa, kuinka voin auttaa?" } }
-          ]
+      // Vastaa puheluun Telnyxin kautta
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json"
         }
       });
+
+      // Puhu heti kun vastattu
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          voice: "female",
+          language: "fi-FI",
+          payload: "Hei! Tervetuloa, kuinka voin auttaa?"
+        })
+      });
+
+      return res.status(200).json({ success: true });
     }
 
     // Jos puhetta tulee webhookista
@@ -52,31 +71,33 @@ app.post("/webhook", async (req, res) => {
         return res.json({ data: { result: "noop" } });
       }
 
-      // Lisää käyttäjän viesti keskusteluun
       conversations[callId].push({ role: "user", content: transcript });
 
-      // Kutsu OpenAI:ta
       const aiResponse = await client.chat.completions.create({
         model: "gpt-4o-mini",
         messages: conversations[callId]
       });
 
       const reply = aiResponse.choices[0].message.content;
-
-      // Lisää botin vastaus muistiin
       conversations[callId].push({ role: "assistant", content: reply });
 
-      return res.json({
-        data: {
-          result: "actions",
-          actions: [
-            { say: { text: reply } }
-          ]
-        }
+      // Lähetetään vastaus Telnyxille
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          voice: "female",
+          language: "fi-FI",
+          payload: reply
+        })
       });
+
+      return res.status(200).json({ success: true });
     }
 
-    // Kun puhelu päättyy, tyhjennetään muisti
     if (event === "call.ended") {
       delete conversations[callId];
     }
@@ -88,7 +109,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Renderin portti
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
