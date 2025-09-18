@@ -7,7 +7,7 @@ import fetch from "node-fetch";
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" })); // ✅ Sallitaan isompi payload
+app.use(bodyParser.json({ limit: "10mb" })); // Sallitaan isompi payload
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -17,7 +17,7 @@ const conversations = {};
 
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "3OArekHEkHv5XvmZirVD"; // joku default ääni
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "3OArekHEkHv5XvmZirVD"; // oletusääni
 
 // ElevenLabs TTS-funktio
 async function synthesizeWithElevenLabs(text) {
@@ -62,7 +62,7 @@ app.post("/webhook", async (req, res) => {
 
     console.log("Webhook event:", event, "CallID:", callId);
 
-    // Alku: vastaa kun puhelu alkaa
+    // Kun puhelu alkaa
     if (event === "call.initiated") {
       conversations[callId] = [
         { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja." }
@@ -77,7 +77,7 @@ app.post("/webhook", async (req, res) => {
         }
       });
 
-      // Tervehdys ElevenLabsin kautta
+      // Soita tervehdys ElevenLabsilla
       const greetingAudio = await synthesizeWithElevenLabs("Hei! Tervetuloa, kuinka voin auttaa?");
 
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
@@ -87,14 +87,14 @@ app.post("/webhook", async (req, res) => {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          audio_url: `data:audio/wav;base64,${greetingAudio}`
+          audio_url: `data:audio/mpeg;base64,${greetingAudio}` // 🔥 vaihdettu wav → mpeg
         })
       });
 
       return res.status(200).json({ success: true });
     }
 
-    // Jos puhetta tulee webhookista
+    // Jos käyttäjä puhuu
     if (event === "call.speech") {
       const transcript = req.body.data.payload?.speech?.transcription || "";
 
@@ -121,13 +121,14 @@ app.post("/webhook", async (req, res) => {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          audio_url: `data:audio/wav;base64,${replyAudio}`
+          audio_url: `data:audio/mpeg;base64,${replyAudio}` // 🔥 myös tässä wav → mpeg
         })
       });
 
       return res.status(200).json({ success: true });
     }
 
+    // Kun puhelu päättyy
     if (event === "call.ended") {
       delete conversations[callId];
     }
