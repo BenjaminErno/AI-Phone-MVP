@@ -1,120 +1,203 @@
 import express from "express";
-import fetch from "node-fetch";
 import bodyParser from "body-parser";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+import fetch from "node-fetch";
+import { randomUUID } from "crypto";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+dotenv.config();
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
-app.use("/audio", express.static(path.join(__dirname, "public")));
 
-// ==== ENV variables ====
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "3OArekHEkHv5XvmZirVD";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://ai-phone-mvp.onrender.com";
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
-// ==== Luo public-kansio jos puuttuu ====
-const publicDir = path.join(__dirname, "public");
-if (!fs.existsSync(publicDir)) {
-  fs.mkdirSync(publicDir);
+const conversations = {};
+
+const PUBLIC_BASE_URL = (
+  process.env.PUBLIC_BASE_URL || "https://ai-phone-mvp.onrender.com"
+).replace(/\/$/, "");
+
+const audioStore = new Map();
+const callAudioIds = new Map();
+
+function registerAudio(callId, buffer) {
+  const id = randomUUID();
+  const entry = {
+    buffer,
+    mimeType: "audio/mpeg",
+    callId,
+    timeout: null,
+    cleanup: null
+  };
+
+  entry.cleanup = () => {
+    if (entry.timeout) {
+      clearTimeout(entry.timeout);
+      entry.timeout = null;
+    }
+    audioStore.delete(id);
+    const ids = callAudioIds.get(callId);
+    if (ids) {
+      ids.delete(id);
+      if (ids.size === 0) {
+        callAudioIds.delete(callId);
+      }
+    }
+  };
+
+  entry.timeout = setTimeout(() => {
+    console.log(`🧹 Auto-cleaning audio for call ${callId} (${id})`);
+    entry.cleanup();
+  }, 10 * 60 * 1000);
+
+  audioStore.set(id, entry);
+  if (!callAudioIds.has(callId)) {
+    callAudioIds.set(callId, new Set());
+  }
+  callAudioIds.get(callId).add(id);
+
+  return { id, cleanup: entry.cleanup };
 }
 
-// ==== ElevenLabs TTS ====
-async function synthesizeWithElevenLabs(text, filename) {
-  console.log(`🔊 Generating TTS with ElevenLabs voice=${ELEVEN_VOICE_ID}`);
+function cleanupAudioForCall(callId) {
+  const ids = callAudioIds.get(callId);
+  if (!ids) {
+    return;
+  }
+
+  for (const audioId of Array.from(ids)) {
+    const entry = audioStore.get(audioId);
+    if (entry) {
+      entry.cleanup();
+    }
+  }
+}
+
+function resolveCallId(payload = {}) {
+  return (
+    payload.call_control_id ||
+    payload.call_session_id ||
+    payload.call_leg_id ||
+    payload.call_id ||
+    "default"
+  );
+}
+
+// ElevenLabs TTS → palauttaa MP3-bufferin
+async function synthesizeWithElevenLabs(text) {
+  console.log("🔊 Generating TTS with ElevenLabs voice=" + ELEVEN_VOICE_ID);
 
   const response = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
     {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
         "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         text,
         voice_settings: {
           stability: 0.3,
-          similarity_boost: 0.7,
+          similarity_boost: 0.8
         },
-        output_format: "mp3_44100_128", // Telnyx ymmärtää yleensä tämän
-      }),
+        output_format: "mp3_44100"
+      })
     }
   );
 
   if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`ElevenLabs error: ${err}`);
+    const error = await response.text();
+    throw new Error("ElevenLabs error: " + error);
   }
 
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const filePath = path.join(publicDir, filename);
-  fs.writeFileSync(filePath, buffer);
-
-  const url = `${PUBLIC_BASE_URL}/audio/${filename}`;
-  console.log(`✅ Audio ready at: ${url}`);
-  return url;
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
-// ==== Telnyx: Answer ====
-async function answerCall(callControlId) {
-  console.log(`📞 Answering call: ${callControlId}`);
-  const res = await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/answer`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${TELNYX_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-  });
-  return res.json();
-}
+// Healthcheck
+app.get("/healthz", (req, res) => res.send("ok"));
 
-// ==== Telnyx: Play audio ====
-async function playAudio(callControlId, audioUrl) {
-  console.log(`▶️ Playing audio: ${audioUrl}`);
-  const res = await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/playback_start`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${TELNYX_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ audio_url: audioUrl }),
-  });
-  const data = await res.json();
-  console.log("▶️ Telnyx playback_start response:", data);
-  return data;
-}
+app.get("/tts/:id", (req, res) => {
+  const entry = audioStore.get(req.params.id);
 
-// ==== Webhook ====
+  if (!entry) {
+    return res.status(404).send("Audio not found");
+  }
+
+  res.setHeader("Content-Type", entry.mimeType);
+  res.setHeader("Content-Length", entry.buffer.length);
+  res.setHeader("Cache-Control", "no-store");
+  res.write(entry.buffer);
+  res.end();
+});
+
+// Telnyx webhook
 app.post("/webhook", async (req, res) => {
-  const event = req.body?.data?.event_type;
-  const callControlId = req.body?.data?.payload?.call_control_id;
+  try {
+    const event = req.body.data?.event_type;
+    const payload = req.body.data?.payload || {};
+    const callId = resolveCallId(payload);
 
-  console.log("Webhook event:", event, "CallID:", callControlId);
+    console.log("Webhook event:", event, "CallID:", callId);
 
-  if (event === "call.initiated") {
-    try {
-      await answerCall(callControlId);
-      const audioUrl = await synthesizeWithElevenLabs(
-        "Hei, tervetuloa testaamaan suomenkielistä puhetta!",
-        "greeting.mp3"
+    if (event === "call.initiated") {
+      conversations[callId] = [
+        { role: "system", content: "Olet ystävällinen asiakaspalvelija suomeksi." }
+      ];
+
+      cleanupAudioForCall(callId);
+
+      // Vastaa puheluun
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json"
+        }
+      });
+
+      // Luo TTS ja tallenna muistiin
+      const greetingBuffer = await synthesizeWithElevenLabs(
+        "Hei! Tervetuloa, kuinka voin auttaa?"
       );
-      await playAudio(callControlId, audioUrl);
-    } catch (err) {
-      console.error("Webhook error:", err);
+
+      const { id: audioId } = registerAudio(callId, greetingBuffer);
+      const greetingUrl = `${PUBLIC_BASE_URL}/tts/${audioId}`;
+
+      // Toista URL:ista
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ audio_url: greetingUrl })
+      });
+
+      return res.json({ ok: true });
     }
+
+    if (event === "call.playback.ended" || event === "call.playback.completed") {
+      cleanupAudioForCall(callId);
+    }
+
+    if (event === "call.ended") {
+      cleanupAudioForCall(callId);
+      delete conversations[callId];
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Webhook error:", err);
+    res.status(500).send("Server error");
   }
-
-  res.sendStatus(200);
 });
 
-// ==== Start server ====
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
