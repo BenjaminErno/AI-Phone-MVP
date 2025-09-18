@@ -3,11 +3,13 @@ import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
 const app = express();
-// Sallitaan isompi payload ettei tule PayloadTooLargeError
+// isompi payload
 app.use(bodyParser.json({ limit: "10mb" }));
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -17,9 +19,9 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const conversations = {};
 
-// ElevenLabs TTS → palauttaa data:audio/mp3;base64
-async function synthesizeWithElevenLabs(text) {
-  console.log("🔊 Sending TTS to ElevenLabs voice=" + ELEVEN_VOICE_ID);
+// ElevenLabs TTS → tallennetaan tiedostoksi
+async function synthesizeWithElevenLabs(text, filename) {
+  console.log("🔊 Generating TTS with ElevenLabs voice=" + ELEVEN_VOICE_ID);
 
   const response = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
@@ -47,13 +49,20 @@ async function synthesizeWithElevenLabs(text) {
 
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
-  const audioBase64 = buffer.toString("base64");
 
-  return "data:audio/mp3;base64," + audioBase64;
+  // tallennetaan public-kansioon
+  const filePath = path.join("/opt/render/project/src/public", filename);
+  fs.writeFileSync(filePath, buffer);
+
+  // palautetaan URL
+  return `${process.env.PUBLIC_BASE_URL || "https://ai-phone-mvp.onrender.com"}/audio/${filename}`;
 }
 
 // Healthcheck
 app.get("/healthz", (req, res) => res.send("ok"));
+
+// Julkinen kansio audion jakamiseen
+app.use("/audio", express.static("public"));
 
 // Telnyx webhook
 app.post("/webhook", async (req, res) => {
@@ -77,10 +86,10 @@ app.post("/webhook", async (req, res) => {
         }
       });
 
-      // Luo TTS
-      const greetingUrl = await synthesizeWithElevenLabs("Hei! Tervetuloa, kuinka voin auttaa?");
+      // Luo TTS ja tallenna tiedostoksi
+      const greetingUrl = await synthesizeWithElevenLabs("Hei! Tervetuloa, kuinka voin auttaa?", "greeting.mp3");
 
-      // Toista se
+      // Toista URL:ista
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
         method: "POST",
         headers: {
