@@ -1,15 +1,17 @@
 {
   "name": "ai-phone-mvp",
   "version": "1.0.0",
-  "description": "MVP AI phone bot with Telnyx + OpenAI TTS (Finnish)",
+  "description": "MVP AI phone bot with Telnyx + OpenAI + ElevenLabs",
   "main": "server.js",
   "type": "module",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
+    "express": "^4.18.2",
     "body-parser": "^1.20.2",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "node-fetch": "^3.3.2",
-    "openai": "^4.0.0"
+    "openai": "^4.0.0",
+    "node-fetch": "^3.3.2"
   }
 }
