@@ -9,7 +9,6 @@ import path from "path";
 dotenv.config();
 
 const app = express();
-// isompi payload
 app.use(bodyParser.json({ limit: "10mb" }));
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -50,8 +49,13 @@ async function synthesizeWithElevenLabs(text, filename) {
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
 
-  // tallennetaan public-kansioon
-  const filePath = path.join("/opt/render/project/src/public", filename);
+  // varmista että public/ kansio on olemassa
+  const publicDir = path.join("/opt/render/project/src/public");
+  if (!fs.existsSync(publicDir)) {
+    fs.mkdirSync(publicDir, { recursive: true });
+  }
+
+  const filePath = path.join(publicDir, filename);
   fs.writeFileSync(filePath, buffer);
 
   // palautetaan URL
@@ -87,7 +91,10 @@ app.post("/webhook", async (req, res) => {
       });
 
       // Luo TTS ja tallenna tiedostoksi
-      const greetingUrl = await synthesizeWithElevenLabs("Hei! Tervetuloa, kuinka voin auttaa?", "greeting.mp3");
+      const greetingUrl = await synthesizeWithElevenLabs(
+        "Hei! Tervetuloa, kuinka voin auttaa?",
+        "greeting.mp3"
+      );
 
       // Toista URL:ista
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
