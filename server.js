@@ -1,8 +1,3 @@
-diff --git a/server.js b/server.js
-index 0b6aa441ff8802221d86609405c8ad8ab3fd3987..913cc6b0618a83172ed7eb4b0c41cd665b089418 100644
---- a/server.js
-+++ b/server.js
-@@ -1,124 +1,202 @@
  import express from "express";
  import bodyParser from "body-parser";
  import dotenv from "dotenv";
