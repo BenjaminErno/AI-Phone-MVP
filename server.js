@@ -7,33 +7,22 @@ import fetch from "node-fetch";
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json());
+
+// 🔧 Sallitaan isommat webhook-payloadit (Telnyx lähettää isoja)
+app.use(bodyParser.json({ limit: "10mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "10mb" }));
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+const conversations = {};
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
 
-// Keskustelut tallennetaan puhelun mukaan
-const conversations = {};
-
-// Health check
+// Healthcheck
 app.get("/healthz", (req, res) => {
   res.send("ok");
 });
-
-// Funktio: luodaan suomenkielinen puhe OpenAI:lla
-async function synthesizeSpeech(text) {
-  const response = await client.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice: "alloy", // tähän voi vaihtaa äänen, alloy on default
-    input: text
-  });
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  return buffer.toString("base64");
-}
 
 // Telnyx webhook
 app.post("/webhook", async (req, res) => {
@@ -43,79 +32,89 @@ app.post("/webhook", async (req, res) => {
 
     console.log("Webhook event:", event, "CallID:", callId);
 
-    // Vastataan puheluun
+    // Vastaa puheluun kun se alkaa
     if (event === "call.initiated") {
       conversations[callId] = [
-        { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat suomeksi ja kysyt lisätietoja tarvittaessa." }
+        {
+          role: "system",
+          content:
+            "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja."
+        }
       ];
 
-      // Vastaa puheluun
+      console.log("Answering call:", callId);
+
+      // Vastaa puheluun Telnyxin kautta
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
           "Content-Type": "application/json"
         }
-      });
+      }).then(r => r.json())
+        .then(resp => console.log("Telnyx answer response:", resp));
 
-      // Tervehdys heti alkuun
-      const audioBase64 = await synthesizeSpeech("Hei! Tervetuloa, kuinka voin auttaa?");
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
+      // Puhu heti kun vastattu
+      console.log("Speaking greeting...");
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          audio_url: `data:audio/mp3;base64,${audioBase64}`
+          voice: "female",
+          language: "en-US",   // Telnyx ei tue suomea, täältä pitää vaihtaa jos lisätään TTS workaround
+          payload: "Hei! Tervetuloa, kuinka voin auttaa?"
         })
-      });
+      }).then(r => r.json())
+        .then(resp => console.log("Telnyx speak response:", resp));
 
       return res.status(200).json({ success: true });
     }
 
-    // Asiakkaan puhe
+    // Jos puhetta tulee webhookista
     if (event === "call.speech") {
       const transcript = req.body.data.payload?.speech?.transcription || "";
+
       if (!transcript) {
         return res.json({ data: { result: "noop" } });
       }
 
-      console.log("Asiakas sanoi:", transcript);
+      console.log("User said:", transcript);
 
       conversations[callId].push({ role: "user", content: transcript });
 
-      // OpenAI vastaus
       const aiResponse = await client.chat.completions.create({
         model: "gpt-4o-mini",
         messages: conversations[callId]
       });
 
       const reply = aiResponse.choices[0].message.content;
+      console.log("AI replied:", reply);
+
       conversations[callId].push({ role: "assistant", content: reply });
 
-      console.log("Botti vastaa:", reply);
-
-      // Muunna ääneksi
-      const audioBase64 = await synthesizeSpeech(reply);
-
-      // Soita vastaus asiakkaalle
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
+      // Lähetetään vastaus Telnyxille
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          audio_url: `data:audio/mp3;base64,${audioBase64}`
+          voice: "female",
+          language: "en-US",
+          payload: reply
         })
-      });
+      }).then(r => r.json())
+        .then(resp => console.log("Telnyx speak response:", resp));
 
       return res.status(200).json({ success: true });
     }
 
-    // Kun puhelu loppuu
-    if (event === "call.hangup") {
+    if (event === "call.ended") {
+      console.log("Call ended, clearing memory for:", callId);
       delete conversations[callId];
     }
 
@@ -126,9 +125,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Renderin portti
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
-
