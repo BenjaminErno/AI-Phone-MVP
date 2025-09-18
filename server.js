@@ -7,24 +7,21 @@ import fetch from "node-fetch";
 dotenv.config();
 
 const app = express();
+// Sallitaan isompi payload ettei tule PayloadTooLargeError
 app.use(bodyParser.json({ limit: "10mb" }));
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "3OArekHEkHv5XvmZirVD"; // joku oletusääni
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
-// Muisti keskustelulle
 const conversations = {};
 
-// 🔊 ElevenLabs TTS PCM 16kHz
+// ElevenLabs TTS → palauttaa data:audio/mp3;base64
 async function synthesizeWithElevenLabs(text) {
   console.log("🔊 Sending TTS to ElevenLabs voice=" + ELEVEN_VOICE_ID);
 
-  const resp = await fetch(
+  const response = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
     {
       method: "POST",
@@ -35,33 +32,30 @@ async function synthesizeWithElevenLabs(text) {
       body: JSON.stringify({
         text,
         voice_settings: {
-          stability: 0.4,
+          stability: 0.3,
           similarity_boost: 0.8
         },
-        model_id: "eleven_multilingual_v2",
-        output_format: "pcm_16000" // 🔥 tärkeä muutos
+        output_format: "mp3_44100"
       })
     }
   );
 
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error("ElevenLabs error: " + err);
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error("ElevenLabs error: " + error);
   }
 
-  const arrayBuffer = await resp.arrayBuffer();
-  const audioBase64 = Buffer.from(arrayBuffer).toString("base64");
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const audioBase64 = buffer.toString("base64");
 
-  // Telnyxille pitää antaa wav-tyyppinä
-  return "data:audio/wav;base64," + audioBase64;
+  return "data:audio/mp3;base64," + audioBase64;
 }
 
 // Healthcheck
-app.get("/healthz", (req, res) => {
-  res.send("ok");
-});
+app.get("/healthz", (req, res) => res.send("ok"));
 
-// Webhook
+// Telnyx webhook
 app.post("/webhook", async (req, res) => {
   try {
     const event = req.body.data?.event_type;
@@ -71,7 +65,7 @@ app.post("/webhook", async (req, res) => {
 
     if (event === "call.initiated") {
       conversations[callId] = [
-        { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja." }
+        { role: "system", content: "Olet ystävällinen asiakaspalvelija suomeksi." }
       ];
 
       // Vastaa puheluun
@@ -83,59 +77,27 @@ app.post("/webhook", async (req, res) => {
         }
       });
 
-      // Tervetuloa-ääni
-      const audioData = await synthesizeWithElevenLabs("Hei! Tervetuloa, kuinka voin auttaa?");
+      // Luo TTS
+      const greetingUrl = await synthesizeWithElevenLabs("Hei! Tervetuloa, kuinka voin auttaa?");
+
+      // Toista se
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          audio_url: audioData
-        })
+        body: JSON.stringify({ audio_url: greetingUrl })
       });
 
-      return res.status(200).json({ success: true });
-    }
-
-    if (event === "call.speech") {
-      const transcript = req.body.data.payload?.speech?.transcription || "";
-
-      if (!transcript) {
-        return res.json({ data: { result: "noop" } });
-      }
-
-      conversations[callId].push({ role: "user", content: transcript });
-
-      const aiResponse = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: conversations[callId]
-      });
-
-      const reply = aiResponse.choices[0].message.content;
-      conversations[callId].push({ role: "assistant", content: reply });
-
-      const audioData = await synthesizeWithElevenLabs(reply);
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${TELNYX_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          audio_url: audioData
-        })
-      });
-
-      return res.status(200).json({ success: true });
+      return res.json({ ok: true });
     }
 
     if (event === "call.ended") {
       delete conversations[callId];
     }
 
-    return res.json({ data: { result: "noop" } });
+    return res.json({ ok: true });
   } catch (err) {
     console.error("Webhook error:", err);
     res.status(500).send("Server error");
@@ -143,6 +105,4 @@ app.post("/webhook", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
