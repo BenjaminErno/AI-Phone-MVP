@@ -2,7 +2,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import fetch from "node-fetch";   // tämä pitää olla mukana!
+import fetch from "node-fetch";
 
 dotenv.config();
 
@@ -13,9 +13,7 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// Pidetään keskustelut muistissa puhelun ID:n mukaan
 const conversations = {};
-
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
 
 // Healthcheck
@@ -26,18 +24,21 @@ app.get("/healthz", (req, res) => {
 // Telnyx webhook
 app.post("/webhook", async (req, res) => {
   try {
+    console.log("=== Incoming Webhook ===");
+    console.log(JSON.stringify(req.body, null, 2)); // LOGITETAAN KAIKKI DATA
+
     const event = req.body.data?.event_type;
     const callId = req.body.data?.payload?.call_control_id || "default";
 
-    console.log("Webhook:", event);
+    console.log("Webhook event:", event, "CallID:", callId);
 
-    // Alku: vastaa kun puhelu alkaa
     if (event === "call.initiated") {
       conversations[callId] = [
         { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaat selkeästi ja kysyt tarvittaessa lisätietoja." }
       ];
 
-      // Vastaa puheluun Telnyxin kautta
+      // Vastaa puheluun
+      console.log("Answering call:", callId);
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
         method: "POST",
         headers: {
@@ -46,7 +47,8 @@ app.post("/webhook", async (req, res) => {
         }
       });
 
-      // Puhu heti kun vastattu
+      // Puhu heti
+      console.log("Speaking greeting...");
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
         method: "POST",
         headers: {
@@ -63,13 +65,9 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ success: true });
     }
 
-    // Jos puhetta tulee webhookista
     if (event === "call.speech") {
       const transcript = req.body.data.payload?.speech?.transcription || "";
-
-      if (!transcript) {
-        return res.json({ data: { result: "noop" } });
-      }
+      if (!transcript) return res.json({ data: { result: "noop" } });
 
       conversations[callId].push({ role: "user", content: transcript });
 
@@ -81,7 +79,8 @@ app.post("/webhook", async (req, res) => {
       const reply = aiResponse.choices[0].message.content;
       conversations[callId].push({ role: "assistant", content: reply });
 
-      // Lähetetään vastaus Telnyxille
+      console.log("AI reply:", reply);
+
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
         method: "POST",
         headers: {
@@ -100,6 +99,7 @@ app.post("/webhook", async (req, res) => {
 
     if (event === "call.ended") {
       delete conversations[callId];
+      console.log("Call ended, memory cleared:", callId);
     }
 
     return res.json({ data: { result: "noop" } });
