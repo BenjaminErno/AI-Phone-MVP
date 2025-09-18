@@ -25,7 +25,7 @@ app.get("/healthz", (req, res) => {
 app.post("/webhook", async (req, res) => {
   try {
     console.log("=== Incoming Webhook ===");
-    console.log(JSON.stringify(req.body, null, 2)); // LOGITETAAN KAIKKI DATA
+    console.log(JSON.stringify(req.body, null, 2));
 
     const event = req.body.data?.event_type;
     const callId = req.body.data?.payload?.call_control_id || "default";
@@ -39,17 +39,19 @@ app.post("/webhook", async (req, res) => {
 
       // Vastaa puheluun
       console.log("Answering call:", callId);
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
+      const answerResp = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
           "Content-Type": "application/json"
         }
       });
+      const answerData = await answerResp.json();
+      console.log("Telnyx answer response:", answerData);
 
       // Puhu heti
       console.log("Speaking greeting...");
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
+      const speakResp = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
@@ -61,6 +63,8 @@ app.post("/webhook", async (req, res) => {
           payload: "Hei! Tervetuloa, kuinka voin auttaa?"
         })
       });
+      const speakData = await speakResp.json();
+      console.log("Telnyx speak response:", speakData);
 
       return res.status(200).json({ success: true });
     }
@@ -81,7 +85,7 @@ app.post("/webhook", async (req, res) => {
 
       console.log("AI reply:", reply);
 
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
+      const speakResp = await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speak`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
@@ -93,6 +97,8 @@ app.post("/webhook", async (req, res) => {
           payload: reply
         })
       });
+      const speakData = await speakResp.json();
+      console.log("Telnyx speak response:", speakData);
 
       return res.status(200).json({ success: true });
     }
