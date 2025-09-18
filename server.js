@@ -35,17 +35,12 @@ function registerAudio(callId, buffer) {
   };
 
   entry.cleanup = () => {
-    if (entry.timeout) {
-      clearTimeout(entry.timeout);
-      entry.timeout = null;
-    }
+    if (entry.timeout) clearTimeout(entry.timeout);
     audioStore.delete(id);
     const ids = callAudioIds.get(callId);
     if (ids) {
       ids.delete(id);
-      if (ids.size === 0) {
-        callAudioIds.delete(callId);
-      }
+      if (ids.size === 0) callAudioIds.delete(callId);
     }
   };
 
@@ -55,9 +50,7 @@ function registerAudio(callId, buffer) {
   }, 10 * 60 * 1000);
 
   audioStore.set(id, entry);
-  if (!callAudioIds.has(callId)) {
-    callAudioIds.set(callId, new Set());
-  }
+  if (!callAudioIds.has(callId)) callAudioIds.set(callId, new Set());
   callAudioIds.get(callId).add(id);
 
   return { id, cleanup: entry.cleanup };
@@ -66,7 +59,6 @@ function registerAudio(callId, buffer) {
 function cleanupAudioForCall(callId) {
   const ids = callAudioIds.get(callId);
   if (!ids) return;
-
   for (const audioId of Array.from(ids)) {
     const entry = audioStore.get(audioId);
     if (entry) entry.cleanup();
@@ -97,10 +89,7 @@ async function synthesizeWithElevenLabs(text) {
       },
       body: JSON.stringify({
         text,
-        voice_settings: {
-          stability: 0.3,
-          similarity_boost: 0.8,
-        },
+        voice_settings: { stability: 0.3, similarity_boost: 0.8 },
         model_id: "eleven_multilingual_v2",
         output_format: "mp3_44100",
       }),
@@ -121,9 +110,7 @@ app.get("/healthz", (req, res) => res.send("ok"));
 
 app.get("/tts/:id", (req, res) => {
   const entry = audioStore.get(req.params.id);
-
   if (!entry) return res.status(404).send("Audio not found");
-
   res.setHeader("Content-Type", entry.mimeType);
   res.setHeader("Content-Length", entry.buffer.length);
   res.setHeader("Cache-Control", "no-store");
@@ -156,7 +143,22 @@ app.post("/webhook", async (req, res) => {
         },
       });
 
-      // Luo TTS ja toista
+      // Käynnistä speech recognition
+      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speech`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          language: "fi-FI",
+          speech_timeout_secs: 3,
+          interim_results: false,
+        }),
+      });
+      console.log("🎤 Speech recognition started for call:", callId);
+
+      // Tervehdys
       const greetingBuffer = await synthesizeWithElevenLabs(
         "Hei! Tervetuloa, kuinka voin auttaa?"
       );
@@ -175,32 +177,28 @@ app.post("/webhook", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 🔹 Kun asiakas puhuu
+    // Asiakas puhuu
     if (event === "call.speech") {
       const transcript = payload.speech?.transcription || "";
       if (!transcript) return res.json({ ok: true });
 
       console.log("👤 Asiakas sanoi:", transcript);
-
       conversations[callId].push({ role: "user", content: transcript });
 
-      // Pyydä vastaus OpenAI:lta
+      // AI vastaus
       const aiResponse = await client.chat.completions.create({
         model: "gpt-4o-mini",
         messages: conversations[callId],
       });
-
       const reply = aiResponse.choices[0].message.content;
       console.log("🤖 Botin vastaus:", reply);
-
       conversations[callId].push({ role: "assistant", content: reply });
 
-      // Generoi TTS
+      // TTS vastaus
       const replyBuffer = await synthesizeWithElevenLabs(reply);
       const { id: audioId } = registerAudio(callId, replyBuffer);
       const replyUrl = `${PUBLIC_BASE_URL}/tts/${audioId}`;
 
-      // Soita asiakkaalle
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
         method: "POST",
         headers: {
