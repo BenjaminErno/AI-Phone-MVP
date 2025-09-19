@@ -17,12 +17,86 @@ const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
 
 const conversations = {};
 
-const PUBLIC_BASE_URL = (
+function trimTrailingSlash(value) {
+  return value ? value.replace(/\/$/, "") : value;
+}
+
+function toWebSocketBase(url) {
+  if (!url) return url;
+  if (url.startsWith("wss://") || url.startsWith("ws://")) {
+    return trimTrailingSlash(url);
+  }
+  if (url.startsWith("https://")) {
+    return `wss://${url.slice("https://".length)}`;
+  }
+  if (url.startsWith("http://")) {
+    return `ws://${url.slice("http://".length)}`;
+  }
+  return trimTrailingSlash(url);
+}
+
+const PUBLIC_BASE_URL = trimTrailingSlash(
   process.env.PUBLIC_BASE_URL || "https://ai-phone-mvp.onrender.com"
-).replace(/\/$/, "");
+);
+
+const RELAY_BASE_URL = trimTrailingSlash(process.env.RELAY_BASE_URL || "");
+const RELAY_WS_URL = trimTrailingSlash(
+  process.env.RELAY_WS_URL ||
+    (RELAY_BASE_URL ? `${toWebSocketBase(RELAY_BASE_URL)}/media` : "")
+);
+const RELAY_CONTROL_URL = trimTrailingSlash(
+  process.env.RELAY_CONTROL_URL ||
+    (RELAY_BASE_URL ? `${RELAY_BASE_URL}/sessions` : "")
+);
+const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "";
 
 const audioStore = new Map();
 const callAudioIds = new Map();
+const relayCleanups = new Map();
+
+function registerRelayCleanup(callId, cleanup) {
+  if (!callId || typeof cleanup !== "function") return;
+  if (!relayCleanups.has(callId)) {
+    relayCleanups.set(callId, new Set());
+  }
+  relayCleanups.get(callId).add(cleanup);
+}
+
+function runRelayCleanups(callId) {
+  const cleanups = relayCleanups.get(callId);
+  if (!cleanups) return;
+  for (const cleanup of cleanups) {
+    try {
+      const result = cleanup();
+      if (result && typeof result.then === "function") {
+        result.catch(err =>
+          console.error(`Relay cleanup failed for call ${callId}:`, err)
+        );
+      }
+    } catch (err) {
+      console.error(`Relay cleanup failed for call ${callId}:`, err);
+    }
+  }
+  relayCleanups.delete(callId);
+}
+
+async function notifyRelayStop(callId) {
+  if (!RELAY_CONTROL_URL) return;
+  const url = `${RELAY_CONTROL_URL}/${encodeURIComponent(callId)}`;
+  const headers = { "Content-Type": "application/json" };
+  if (RELAY_AUTH_TOKEN) headers["X-Relay-Token"] = RELAY_AUTH_TOKEN;
+  try {
+    const response = await fetch(url, { method: "DELETE", headers });
+    if (!response.ok && response.status !== 404) {
+      const text = await response.text().catch(() => "");
+      console.error(
+        `Relay stop failed for call ${callId}: ${response.status} ${text}`
+      );
+    }
+  } catch (err) {
+    console.error(`Failed to notify relay stop for call ${callId}:`, err);
+  }
+}
 
 function registerAudio(callId, buffer) {
   const id = randomUUID();
@@ -56,12 +130,17 @@ function registerAudio(callId, buffer) {
   return { id, cleanup: entry.cleanup };
 }
 
-function cleanupAudioForCall(callId) {
+function cleanupAudioForCall(callId, options = {}) {
+  const { includeRelay = false } = options;
   const ids = callAudioIds.get(callId);
-  if (!ids) return;
-  for (const audioId of Array.from(ids)) {
-    const entry = audioStore.get(audioId);
-    if (entry) entry.cleanup();
+  if (ids) {
+    for (const audioId of Array.from(ids)) {
+      const entry = audioStore.get(audioId);
+      if (entry) entry.cleanup();
+    }
+  }
+  if (includeRelay) {
+    runRelayCleanups(callId);
   }
 }
 
@@ -107,6 +186,44 @@ async function synthesizeWithElevenLabs(text) {
   return Buffer.from(arrayBuffer);
 }
 
+async function handleTranscriptForCall(callId, transcript) {
+  const text = (transcript || "").trim();
+  if (!text) return;
+
+  if (!conversations[callId]) {
+    console.warn(
+      `⚠️ Received transcript for unknown call ${callId}; ignoring.`
+    );
+    return;
+  }
+
+  console.log("🎤 User said:", text);
+
+  conversations[callId].push({ role: "user", content: text });
+
+  const aiResponse = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: conversations[callId]
+  });
+
+  const rawReply = aiResponse.choices?.[0]?.message?.content || "";
+  const reply = rawReply.trim() || "Pahoittelut, en ymmärtänyt.";
+  conversations[callId].push({ role: "assistant", content: reply });
+
+  const replyBuffer = await synthesizeWithElevenLabs(reply);
+  const { id: audioId } = registerAudio(callId, replyBuffer);
+  const replyUrl = `${PUBLIC_BASE_URL}/tts/${audioId}`;
+
+  await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TELNYX_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ audio_url: replyUrl })
+  });
+}
+
 // Healthcheck
 app.get("/healthz", (req, res) => res.send("ok"));
 
@@ -118,6 +235,41 @@ app.get("/tts/:id", (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.write(entry.buffer);
   res.end();
+});
+
+app.post("/transcription", async (req, res) => {
+  try {
+    if (RELAY_AUTH_TOKEN && req.headers["x-relay-token"] !== RELAY_AUTH_TOKEN) {
+      return res.status(401).json({ ok: false, message: "Unauthorized" });
+    }
+
+    const { callId, transcript } = req.body || {};
+    if (!callId) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "Missing callId" });
+    }
+
+    const text = (transcript || "").trim();
+    if (!text) {
+      return res.json({ ok: true });
+    }
+
+    if (!conversations[callId]) {
+      console.warn(
+        `⚠️ Transcript received for inactive call ${callId}; ignoring.`
+      );
+      return res
+        .status(202)
+        .json({ ok: false, message: "Call not active" });
+    }
+
+    await handleTranscriptForCall(callId, text);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Transcription webhook error:", err);
+    return res.status(500).json({ ok: false, message: "Server error" });
+  }
 });
 
 // Telnyx webhook
@@ -133,7 +285,7 @@ app.post("/webhook", async (req, res) => {
       conversations[callId] = [
         { role: "system", content: "Olet ystävällinen asiakaspalvelija suomeksi." }
       ];
-      cleanupAudioForCall(callId);
+      cleanupAudioForCall(callId, { includeRelay: true });
 
       // Vastaa puheluun
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/answer`, {
@@ -144,18 +296,45 @@ app.post("/webhook", async (req, res) => {
         }
       });
 
-      // 🚀 Käynnistä puheentunnistus suomeksi
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speech`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${TELNYX_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          language: "fi-FI",
-          speech_timeout: "auto"
-        })
-      });
+      if (RELAY_WS_URL) {
+        const params = new URLSearchParams({ callId });
+        if (RELAY_AUTH_TOKEN) params.set("token", RELAY_AUTH_TOKEN);
+        const streamUrl = `${RELAY_WS_URL}?${params.toString()}`;
+        try {
+          const forkResponse = await fetch(
+            `https://api.telnyx.com/v2/calls/${callId}/actions/fork_start`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${TELNYX_API_KEY}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                stream_url: streamUrl,
+                stream_key: callId,
+                audio_track: "inbound",
+                channels: ["inbound"],
+                chunk_length_ms: 20,
+                sample_rate: 8000
+              })
+            }
+          );
+          if (!forkResponse.ok) {
+            const errorText = await forkResponse.text();
+            console.error(
+              `Telnyx fork_start failed for ${callId}: ${forkResponse.status} ${errorText}`
+            );
+          } else {
+            registerRelayCleanup(callId, () => notifyRelayStop(callId));
+          }
+        } catch (forkErr) {
+          console.error(`Failed to initiate media fork for ${callId}:`, forkErr);
+        }
+      } else {
+        console.warn(
+          "Relay WebSocket URL not configured; skipping Telnyx fork_start"
+        );
+      }
 
       // Ensitervehdys
       const greetingBuffer = await synthesizeWithElevenLabs(
@@ -180,35 +359,9 @@ app.post("/webhook", async (req, res) => {
 
     if (event === "call.speech") {
       const transcript = payload.speech?.transcription || "";
-      if (!transcript) return res.json({ ok: true });
-
-      console.log("🎤 User said:", transcript);
-
-      conversations[callId].push({ role: "user", content: transcript });
-
-      const aiResponse = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: conversations[callId]
-      });
-
-      const reply = aiResponse.choices[0].message.content;
-      conversations[callId].push({ role: "assistant", content: reply });
-
-      const replyBuffer = await synthesizeWithElevenLabs(reply);
-      const { id: audioId } = registerAudio(callId, replyBuffer);
-      const replyUrl = `${PUBLIC_BASE_URL}/tts/${audioId}`;
-
-      await fetch(
-        `https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${TELNYX_API_KEY}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ audio_url: replyUrl })
-        }
-      );
+      if (transcript && conversations[callId]) {
+        await handleTranscriptForCall(callId, transcript);
+      }
     }
 
     if (event === "call.playback.ended" || event === "call.playback.completed") {
@@ -216,7 +369,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (event === "call.ended") {
-      cleanupAudioForCall(callId);
+      cleanupAudioForCall(callId, { includeRelay: true });
       delete conversations[callId];
     }
 
