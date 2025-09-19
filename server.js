@@ -31,7 +31,7 @@ function registerAudio(callId, buffer) {
     mimeType: "audio/mpeg",
     callId,
     timeout: null,
-    cleanup: null,
+    cleanup: null
   };
 
   entry.cleanup = () => {
@@ -85,14 +85,16 @@ async function synthesizeWithElevenLabs(text) {
       method: "POST",
       headers: {
         "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         text,
-        voice_settings: { stability: 0.3, similarity_boost: 0.8 },
-        model_id: "eleven_multilingual_v2",
-        output_format: "mp3_44100",
-      }),
+        voice_settings: {
+          stability: 0.3,
+          similarity_boost: 0.8
+        },
+        output_format: "mp3_44100"
+      })
     }
   );
 
@@ -129,9 +131,8 @@ app.post("/webhook", async (req, res) => {
 
     if (event === "call.initiated") {
       conversations[callId] = [
-        { role: "system", content: "Olet ystävällinen asiakaspalvelija. Vastaa aina suomeksi." },
+        { role: "system", content: "Olet ystävällinen asiakaspalvelija suomeksi." }
       ];
-
       cleanupAudioForCall(callId);
 
       // Vastaa puheluun
@@ -139,76 +140,75 @@ app.post("/webhook", async (req, res) => {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
-          "Content-Type": "application/json",
-        },
+          "Content-Type": "application/json"
+        }
       });
 
-      // Käynnistä speech recognition
+      // 🚀 Käynnistä puheentunnistus suomeksi
       await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/speech`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${TELNYX_API_KEY}`,
-          "Content-Type": "application/json",
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
           language: "fi-FI",
-          speech_timeout_secs: 3,
-          interim_results: false,
-        }),
+          speech_timeout: "auto"
+        })
       });
-      console.log("🎤 Speech recognition started for call:", callId);
 
-      // Tervehdys
+      // Ensitervehdys
       const greetingBuffer = await synthesizeWithElevenLabs(
         "Hei! Tervetuloa, kuinka voin auttaa?"
       );
       const { id: audioId } = registerAudio(callId, greetingBuffer);
       const greetingUrl = `${PUBLIC_BASE_URL}/tts/${audioId}`;
-
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${TELNYX_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ audio_url: greetingUrl }),
-      });
+      await fetch(
+        `https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${TELNYX_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ audio_url: greetingUrl })
+        }
+      );
 
       return res.json({ ok: true });
     }
 
-    // Asiakas puhuu
     if (event === "call.speech") {
       const transcript = payload.speech?.transcription || "";
       if (!transcript) return res.json({ ok: true });
 
-      console.log("👤 Asiakas sanoi:", transcript);
+      console.log("🎤 User said:", transcript);
+
       conversations[callId].push({ role: "user", content: transcript });
 
-      // AI vastaus
       const aiResponse = await client.chat.completions.create({
         model: "gpt-4o-mini",
-        messages: conversations[callId],
+        messages: conversations[callId]
       });
+
       const reply = aiResponse.choices[0].message.content;
-      console.log("🤖 Botin vastaus:", reply);
       conversations[callId].push({ role: "assistant", content: reply });
 
-      // TTS vastaus
       const replyBuffer = await synthesizeWithElevenLabs(reply);
       const { id: audioId } = registerAudio(callId, replyBuffer);
       const replyUrl = `${PUBLIC_BASE_URL}/tts/${audioId}`;
 
-      await fetch(`https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${TELNYX_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ audio_url: replyUrl }),
-      });
-
-      return res.json({ ok: true });
+      await fetch(
+        `https://api.telnyx.com/v2/calls/${callId}/actions/playback_start`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${TELNYX_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ audio_url: replyUrl })
+        }
+      );
     }
 
     if (event === "call.playback.ended" || event === "call.playback.completed") {
